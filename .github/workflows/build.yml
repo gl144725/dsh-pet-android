@@ -28,11 +28,16 @@ jobs:
       - name: 安装 ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: 安装 Android SDK
-        uses: android-actions/setup-android@v3
-
+      # runner 自带 Android SDK，不用 android-actions/setup-android
+      # （那个 action 会去装已被移除的 'tools' 包，直接失败）
       - name: 安装 SDK 组件
-        run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+        run: |
+          set -e
+          SDKMGR=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          echo "sdkmanager: $SDKMGR"
+          test -n "$SDKMGR"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>&1 | tail -5
 
       - name: 还原素材（从上游 dsh-pet 转码）
         run: |
