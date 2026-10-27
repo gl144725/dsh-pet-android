@@ -10,7 +10,11 @@ import java.io.File
  * （对照 `Lines.kt:141-143`：外部文件存在就用外部的，不存在用 app 内默认值）。
  *
  * 字段：api_base / api_key / api_model / persona / tts_on / enabled
+ *      + Mattermost：mm_on / mm_url / mm_token / mm_channel（channel_id，不是频道名）
  * 文件缺失或 api_key 为空 = 「AI 未配置」，AI 层整体静默，桌宠回到纯台词模式。
+ *
+ * **token 的规矩**：`mm_token` 只存在于这个本地文件与内存里 —— 不写进源码、不进 git、
+ * 不进 Diag 日志（Diag 只记「发失败了」，从不把 token 拼进字符串）。
  */
 data class AiConfig(
     val apiBase: String,
@@ -19,9 +23,20 @@ data class AiConfig(
     val persona: String,
     val ttsOn: Boolean,
     val enabled: Boolean,
+    val mmOn: Boolean = false,
+    val mmUrl: String = "",
+    val mmToken: String = "",
+    val mmChannel: String = "",
 ) {
     /** 「已配置」的唯一判据：有 Key（base/model 都能用默认值补上） */
     val configured: Boolean get() = apiKey.isNotBlank()
+
+    /** Mattermost 三项都填了才算配置完整（缺一个就当没配，静默跳过轮询） */
+    val mmConfigured: Boolean
+        get() = mmUrl.isNotBlank() && mmToken.isNotBlank() && mmChannel.isNotBlank()
+
+    /** 真的会去收发 MM：开关开着 + 三项都填了 */
+    val mmActive: Boolean get() = mmOn && mmConfigured
 
     companion object {
         const val FILE_NAME = "ai-config.json"
@@ -49,6 +64,10 @@ data class AiConfig(
             var persona = DEFAULT_PERSONA
             var tts = false
             var enabled = false
+            var mmOn = false
+            var mmUrl = ""
+            var mmToken = ""
+            var mmChannel = ""
             try {
                 val f = file(ctx)
                 if (f.isFile) {
@@ -59,11 +78,15 @@ data class AiConfig(
                     persona = o.optString("persona", DEFAULT_PERSONA).ifBlank { DEFAULT_PERSONA }
                     tts = o.optBoolean("tts_on", false)
                     enabled = o.optBoolean("enabled", false)
+                    mmOn = o.optBoolean("mm_on", false)
+                    mmUrl = o.optString("mm_url", "").trim()
+                    mmToken = o.optString("mm_token", "").trim()
+                    mmChannel = o.optString("mm_channel", "").trim()
                 }
             } catch (t: Throwable) {
                 Diag.record(ctx, "ai-config 读取失败", t)
             }
-            return AiConfig(base, key, model, persona, tts, enabled)
+            return AiConfig(base, key, model, persona, tts, enabled, mmOn, mmUrl, mmToken, mmChannel)
         }
 
         /** 存配置：临时文件 + rename，和记忆文件同一套写法 */
@@ -78,6 +101,10 @@ data class AiConfig(
                     put("persona", cfg.persona.trim().ifBlank { DEFAULT_PERSONA })
                     put("tts_on", cfg.ttsOn)
                     put("enabled", cfg.enabled)
+                    put("mm_on", cfg.mmOn)
+                    put("mm_url", cfg.mmUrl.trim())
+                    put("mm_token", cfg.mmToken.trim())
+                    put("mm_channel", cfg.mmChannel.trim())
                 }
                 val tmp = File(f.parentFile, f.name + ".tmp")
                 tmp.writeText(o.toString(2))

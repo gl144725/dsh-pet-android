@@ -12,7 +12,8 @@ mem_sim.py —— 把 ai/ 下四个「纯函数」用 Python 复刻一遍，灌 
   EventStore.scoreEvent            → score_event()
   ImpressionStore.decay            → decay()
   ImpressionStore.scoreOf          → score_of()
-  ImpressionStore.effectiveScore   → effective_score()
+  ImpressionStore.impFromSources   → imp_from_sources()   （Math.round，不是 ceil）
+  ImpressionStore.forgetDaysAfter  → FORGET_DAYS_BY_IMP   （imp → 天数映射）
   ImpressionStore.shouldForget     → should_forget()
   TextSim.bigrams / overlapOf      → bigrams() / overlap_of()
   ImpressionStore.DEDUPE_THRESHOLD → DEDUPE_THRESHOLD = 0.6
@@ -36,8 +37,13 @@ PUNCT = set("，。、；：？！…—－·「」『』（）()【】[]{}<>《
 RECALL_MIN_SCORE = 5.0
 DEDUPE_THRESHOLD = 0.6
 PROACTIVE_COOLDOWN_DAYS = 7.0
-FORGET_DAYS = 30.0
-FORGET_MIN_SCORE = 2.0  # 与 Kotlin 同步；1.5 在这个系统里不可达，见下方 [4]
+# F5 淡忘口径（与 Kotlin `ImpressionStore.forgetDaysAfter` 同步）：
+# 越重要记得越久。None = 永不遗忘。
+FORGET_DAYS_BY_IMP = {5: None, 4: 180.0, 3: 90.0, 2: 30.0, 1: 7.0}
+
+# 旧口径只留作对照（`imp*0.6 + 0.3*decay < 2.0 && 天数 > 30`），证明它在这个系统里几乎不触发
+OLD_FORGET_DAYS = 30.0
+OLD_FORGET_MIN_SCORE = 2.0
 
 
 # ---------------------------------------------------------------- 纯函数复刻
@@ -83,13 +89,39 @@ def score_of(imp, days_since_last, overlap):
 
 
 def effective_score(imp, days_since_last):
-    """F5 淡忘用的 0..3.4 尺子：imp*0.6 + 0.3*衰减"""
+    """旧 F5 淡忘尺子（0..3.4）：imp*0.6 + 0.3*衰减 —— 只留作对照，正式口径已换成天数映射"""
     return imp * 0.6 + 0.3 * decay(days_since_last)
 
 
-def should_forget(imp, days_since_last, threshold=None):
-    th = FORGET_MIN_SCORE if threshold is None else threshold
-    return days_since_last > FORGET_DAYS and effective_score(imp, days_since_last) < th
+def forget_days_after(imp):
+    """F5：imp → 多久没提就淡忘（天数）；None = 永不遗忘"""
+    return FORGET_DAYS_BY_IMP.get(max(1, min(5, imp)), 7.0)
+
+
+def should_forget(imp, days_since_last):
+    """F5：直接按 imp 查天数，不再用「有效分 < 阈值」那套（那套 imp>=4 永不触发）"""
+    limit = forget_days_after(imp)
+    if limit is None:
+        return False
+    return days_since_last > limit
+
+
+def old_should_forget(imp, days_since_last):
+    """对照用：旧的 effectiveScore + 阈值口径"""
+    return days_since_last > OLD_FORGET_DAYS and effective_score(imp, days_since_last) < OLD_FORGET_MIN_SCORE
+
+
+def imp_from_sources(imps):
+    """F3：新印象的 imp = 来源事件 imp 均值的四舍五入（对齐 Kotlin `Math.round`）
+
+    曾经是 ceil —— 来源本来就筛过 imp>=3，均值 3.x 一向上取整全变 4，
+    于是印象永远停在 imp=4，配合旧阈值就是「什么都不会忘」。
+    """
+    if not imps:
+        return 1
+    # Python 的 round() 是银行家舍入（3.5 → 4 但 2.5 → 2），Java 的 Math.round 是 floor(x+0.5)，
+    # 这里显式写成 floor(mean + 0.5) 才能和 Kotlin 逐位一致。
+    return max(1, min(5, int(math.floor(sum(imps) / len(imps) + 0.5))))
 
 
 def _is_word_char(c):
@@ -207,7 +239,10 @@ def simulate(n_events=1000, seed=20251028):
         if cur is None:
             impressions[ti] = {
                 "text": make_impression(rng, TOPIC_WORDS[ti]),
-                "imp": e["imp"],
+                "imp": imp_from_sources([e["imp"]]),
+                # 旧口径的 imp（ceil），只为了在 [4] 里做 A/B 对照，不参与其他计算
+                "imp_ceil": e["imp"],
+                "src_imp": [e["imp"]],
                 "mentions": 1,
                 "last": e["t"],
                 "born": e["t"],
@@ -215,7 +250,11 @@ def simulate(n_events=1000, seed=20251028):
         else:
             cur["mentions"] += 1
             cur["last"] = max(cur["last"], e["t"])
-            cur["imp"] = int(math.ceil((cur["imp"] + e["imp"]) / 2))
+            cur["src_imp"].append(e["imp"])
+            # 上次提炼的 imp 与这批来源一起重算 —— 对齐 impFromSources 的「来源均值 round」
+            cur["imp"] = imp_from_sources(cur["src_imp"])
+            # 旧口径逐字复刻（A/B 对照用）：逐条配对平均后向上取整
+            cur["imp_ceil"] = max(1, min(5, int(math.ceil((cur["imp_ceil"] + e["imp"]) / 2))))
 
     imp_list = list(impressions.items())
 
@@ -293,18 +332,21 @@ def simulate(n_events=1000, seed=20251028):
                 near_merge += 1
     near_merge_rate = near_merge / near_pairs if near_pairs else 0.0
 
-    # ---- 4) 淡忘：按 F5 跑一遍，看 180 天后能忘掉几条
-    # 同时对比票面写的 1.5 和实测后采用的 2.0，把「1.5 不可达」这件事用数字钉死
+    # ---- 4) 淡忘：按 F5 新口径（imp → 天数映射）跑一遍，看 180 天后能忘掉几条
+    # 同时用旧口径（effectiveScore < 2.0）算一遍作对照，把「旧口径几乎不触发」钉在数字上
     forgotten = 0
-    forgotten_at_15 = 0
+    forgotten_old = 0
     min_eff = 99.0
+    forgotten_by_imp = {}
     for ti, x in imp_list:
         d = max(0.0, (now - x["last"]) / 86400.0)
         if should_forget(x["imp"], d):
             forgotten += 1
-        if should_forget(x["imp"], d, 1.5):
-            forgotten_at_15 += 1
-        min_eff = min(min_eff, effective_score(x["imp"], d))
+            forgotten_by_imp[x["imp"]] = forgotten_by_imp.get(x["imp"], 0) + 1
+        # 旧口径 = 旧的 imp（ceil）+ 旧公式，两个变量一起还原成改之前的样子
+        if old_should_forget(x["imp_ceil"], d):
+            forgotten_old += 1
+        min_eff = min(min_eff, effective_score(x["imp_ceil"], d))
 
     # ---- 5) 主动开口候选数（F8：imp>=3 且 7 天没提过）
     proactive = 0
@@ -324,9 +366,11 @@ def simulate(n_events=1000, seed=20251028):
         "suffix_merge_rate": suffix_merge_rate,
         "near_merge_rate": near_merge_rate,
         "forgotten": forgotten,
-        "forgotten_at_15": forgotten_at_15,
+        "forgotten_old": forgotten_old,
+        "forgotten_by_imp": forgotten_by_imp,
         "min_effective_score": min_eff,
         "imp_dist": {k: sum(1 for _, x in imp_list if x["imp"] == k) for k in range(1, 6)},
+        "imp_dist_old": {k: sum(1 for _, x in imp_list if x["imp_ceil"] == k) for k in range(1, 6)},
         "proactive": proactive,
     }
 
@@ -360,24 +404,30 @@ def main():
     print("    说明：0.6 这个阈值对短句偏严，改写过的同一件事会被当成两条。")
     print("          这是有意的取舍 —— 宁可留两条重复，也不要把两件事糊成一条。")
 
-    print("\n[4] 淡忘与主动开口（180 天后）")
-    print(f"    最低有效分 {r['min_effective_score']:.3f}"
-          f"（imp>=3 时理论下限 1.8，所以票面的阈值 1.5 一条都忘不掉 → 实测 {r['forgotten_at_15']} 条）")
-    print(f"    阈值改用 2.0：淡忘 {r['forgotten']} 条 / 共 {r['impressions']} 条"
-          f"（{r['forgotten'] / max(1, r['impressions']) * 100:.1f}%）")
+    print("\n[4] 淡忘与主动开口（180 天后，口径 = imp → 天数映射）")
+    n_imp = max(1, r["impressions"])
+    print("    口径：imp5 永不遗忘 / imp4 >180 天 / imp3 >90 天 / imp2 >30 天 / imp1 >7 天")
+    print(f"    淡忘 {r['forgotten']} 条 / 共 {r['impressions']} 条"
+          f"（{r['forgotten'] / n_imp * 100:.1f}%）")
     dist = " ".join(f"imp{k}:{v}" for k, v in r["imp_dist"].items() if v)
     print(f"    印象重要性分布 {dist}")
-    print("    只忘掉 imp=3 且 30 天没人提的那批；imp>=4 的一直留着 —— 越重要越难忘。")
-    print("    ⚠ 真实分布偏 imp4：F3 的 imp=ceil(来源事件均值)，而来源本来就筛过 imp>=3，")
-    print("      向上取整把均值 3.x 全抬成 4。所以「会忘」在真实数据上会比这里更少发生，")
-    print("      这是 impFromSources 的口径问题，已记在回报的疑虑里。")
+    by_imp = " ".join(f"imp{k}:{v}" for k, v in sorted(r["forgotten_by_imp"].items()))
+    print(f"    淡忘明细 {by_imp if by_imp else '（无）'}")
+    dist_old = " ".join(f"imp{k}:{v}" for k, v in r["imp_dist_old"].items() if v)
+    print(f"    改前对照（imp=ceil 配对平均 + effectiveScore<{OLD_FORGET_MIN_SCORE} 且 >"
+          f"{OLD_FORGET_DAYS:.0f} 天）：淡忘 {r['forgotten_old']} 条"
+          f"（{r['forgotten_old'] / n_imp * 100:.1f}%），imp 分布 {dist_old}，"
+          f"最低有效分 {r['min_effective_score']:.3f} > 阈值 → imp>=4 永不触发")
+    print(f"    → 改后 {r['forgotten']} 条 vs 改前 {r['forgotten_old']} 条")
     print(f"    主动开口候选 {r['proactive']} 条（imp>=3 且 7 天没提过）")
 
     print("\n结论：")
     print(f"  · 衰减 30 天砍半、90 天剩 1/8 —— 「上个月的事」还模糊记得，「半年前的事」基本忘光。")
     print(f"  · 检索命中率 {r['hit_rate'] * 100:.1f}%，说明按分数取而不是按时间取，确实串得起来。")
     print(f"  · 误合并 {r['false_merge_rate'] * 100:.1f}%：0.6 的阈值不会把不相干的事糊在一起；")
-    print(f"    代价是改写过的重复会留下两条，靠 F5 淡忘（30 天没提就归档）慢慢清掉。")
+    print(f"    代价是改写过的重复会留下两条，靠 F5 淡忘（按 imp 天数归档）慢慢清掉。")
+    print(f"  · 淡忘 {r['forgotten'] / n_imp * 100:.1f}%（旧口径 {r['forgotten_old'] / n_imp * 100:.1f}%）"
+          f"—— impFromSources 改 round、阈值改 imp→天数后，「会忘」才真的会忘。")
     print("=" * 66)
 
 

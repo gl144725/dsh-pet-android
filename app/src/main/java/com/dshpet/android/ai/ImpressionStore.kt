@@ -5,7 +5,6 @@ import com.dshpet.android.Diag
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import kotlin.math.ceil
 import kotlin.math.pow
 
 /**
@@ -14,7 +13,8 @@ import kotlin.math.pow
  * [{"id":"i1","text":"...","imp":1-5,"mentions":0,"last":秒,"born":秒,"src":["e12"]}]
  *
  * 「会串」= 这里按分数排（不是按时间取最新 5 条）；
- * 「会忘」= 分低且 30 天没被提起的挪进 `archive.jsonl`（不是删，超过 500 条才真的丢最老的）。
+ * 「会忘」= 按 imp 决定容忍天数（imp5 永不 / imp4 180 天 / imp3 90 天 / imp2 30 天 / imp1 7 天），
+ *          超过就挪进 `archive.jsonl`（不是删，超过 500 条才真的丢最老的）。
  */
 class ImpressionStore(private val ctx: Context) {
 
@@ -213,7 +213,7 @@ class ImpressionStore(private val ctx: Context) {
     // ------------------------------------------------------------ F5 淡忘
 
     /**
-     * 有效分 < 1.5 且 30 天没被提起 → 挪进 archive.jsonl。
+     * 按 imp 的容忍天数判断：超过就挪进 `archive.jsonl`（见 [forgetDaysAfter]）。
      * @return 本次归档条数
      */
     fun forget(now: Long): Int {
@@ -312,20 +312,6 @@ class ImpressionStore(private val ctx: Context) {
         /** F5：归档上限，超过才真的丢最老的 */
         const val ARCHIVE_CAP = 500
 
-        /** F5：多久没被提起才算「可以忘」 */
-        const val FORGET_DAYS = 30.0
-
-        /**
-         * F5：有效分阈值。
-         *
-         * 票面 §一.1 写的是 1.5，但那个数在这个系统里**不可达**：提炼门槛是 imp>=3
-         * （`MemoryCore.DISTILL_MIN_IMP`），印象的 imp = ceil(来源事件均值) >= 3，
-         * 于是有效分最低也有 `3*0.6 + 0 = 1.8` > 1.5 —— 一条都忘不掉，「会忘」形同虚设。
-         * 改成 2.0：imp=3 且 30 天没人提的印象会真的淡出，imp>=4 的留下。
-         * 这个数是 tools/mem_sim.py 跑出来的（1.5 时淡忘 0 条），实测见该脚本输出。
-         */
-        const val FORGET_MIN_SCORE = 2.0
-
         /** 半衰期 30 天：0.5 ^ (天数差 / 30) */
         fun decay(daysSinceLast: Double): Double {
             if (daysSinceLast <= 0.0) return 1.0
@@ -347,23 +333,43 @@ class ImpressionStore(private val ctx: Context) {
             imp * 6.0 + 30.0 * decay(daysSinceLast) + 20.0 * overlap
 
         /**
-         * F5 淡忘用的「有效分」（票面 §一.1 的原口径，量纲 0..3.4）：
-         *   imp×0.6 + 衰减×0.3 + 关键词×0.1（淡忘时不看关键词，按 0 算）
-         * 注意：F4 的 score 最低也有 6 分，永远不可能 < 5，
-         * 若拿它当淡忘阈值则一条都忘不掉 —— 所以淡忘用这一把 0..3.4 的尺子。
+         * F5：**越重要记得越久** —— 直接按 imp 给「多久没提就淡忘」的天数。
+         *
+         * 旧口径是 `imp*0.6 + 0.3*decay < 2.0`（`FORGET_MIN_SCORE`），在本系统里几乎失效：
+         * 提炼门槛 `MemoryCore.DISTILL_MIN_IMP = 3` 让印象的 imp 普遍 >= 4，
+         * 而 imp=4 时有效分最低也有 2.4 > 2.0，于是 `tools/mem_sim.py` 实测
+         * 17 条印象只有 1 条会淡忘（5.9%），`imp>=4` 的永远忘不掉 ——
+         * 那叫「全记得」，不叫「会忘」。改成直接的 imp → 天数映射后，口径更像人。
          */
-        fun effectiveScore(imp: Int, daysSinceLast: Double): Double =
-            imp * 0.6 + 0.3 * decay(daysSinceLast)
+        fun forgetDaysAfter(imp: Int): Double = when {
+            imp >= 5 -> NEVER_FORGET
+            imp == 4 -> 180.0
+            imp == 3 -> 90.0
+            imp == 2 -> 30.0
+            else -> 7.0
+        }
 
-        fun shouldForget(imp: Int, daysSinceLast: Double): Boolean =
-            daysSinceLast > FORGET_DAYS && effectiveScore(imp, daysSinceLast) < FORGET_MIN_SCORE
+        /** 「永不遗忘」的哨兵值（用 MAX_VALUE 而不是 Infinity，方便 dump / 序列化比较） */
+        const val NEVER_FORGET = Double.MAX_VALUE
 
-        /** 新印象的 imp = 来源事件 imp 的均值向上取整（F3） */
+        /** F5：距上次提及超过对应 imp 的容忍天数 → 可以淡忘（imp=5 永不） */
+        fun shouldForget(imp: Int, daysSinceLast: Double): Boolean {
+            val limit = forgetDaysAfter(imp)
+            if (limit >= NEVER_FORGET) return false
+            return daysSinceLast > limit
+        }
+
+        /**
+         * 新印象的 imp = 来源事件 imp 均值的**四舍五入**（F3）。
+         *
+         * 曾经是 `ceil`：来源事件本来就筛过 `imp>=3`，均值 3.x 一向上取整全变成 4，
+         * 结果印象永远停在 imp=4 —— 配合旧阈值就是「什么都不会忘」。见 mem_sim.py 实测。
+         */
         fun impFromSources(imps: List<Int>): Int {
             if (imps.isEmpty()) return 1
             var sum = 0
             for (x in imps) sum += x
-            return ceil(sum.toDouble() / imps.size).toInt().coerceIn(1, 5)
+            return Math.round(sum.toDouble() / imps.size).toInt().coerceIn(1, 5)
         }
     }
 }

@@ -14,6 +14,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.dshpet.android.Prefs
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * F9：AI 设置页。单页、全代码构建（不新增任何 res 文件，沿用 app 现有配色），
@@ -21,6 +24,8 @@ import com.dshpet.android.Prefs
  *
  * 这里刻意画得很「素」：AI 是能力层，不是主界面。配置错误时唯一的后果是
  * 「她变回原来的台词模式」，所以不需要花哨的状态机。
+ *
+ * F2 追加：Mattermost 四项（开关 / 地址 / Token / 频道 ID）+「测试连接」+「MM 最近消息」。
  */
 class AiSettingsActivity : Activity() {
 
@@ -29,6 +34,10 @@ class AiSettingsActivity : Activity() {
     private lateinit var etKey: EditText
     private lateinit var etModel: EditText
     private lateinit var cbTts: CheckBox
+    private lateinit var cbMm: CheckBox
+    private lateinit var etMmUrl: EditText
+    private lateinit var etMmToken: EditText
+    private lateinit var etMmChannel: EditText
     private lateinit var tvStatus: TextView
 
     /** 界面上没暴露人设编辑，但保存时必须原样带回去，别把用户手改的人设冲掉 */
@@ -89,6 +98,22 @@ class AiSettingsActivity : Activity() {
             setPadding(0, dp(10), 0, dp(2))
         }
         root.addView(cbTts)
+
+        // ---- F2：Mattermost（你在 MM 上说话，她在桌面上回，并且把回话发回 MM）
+        root.addView(section("Mattermost（双向收发）"))
+        cbMm = CheckBox(this).apply {
+            text = "启用 Mattermost（每 30 秒收一次新消息）"
+            setTextColor(cText)
+            textSize = 15f
+            isChecked = cfg.mmOn
+            setPadding(0, dp(10), 0, dp(2))
+        }
+        root.addView(cbMm)
+        etMmUrl = input(root, "服务器地址（https://mm.example.com）", cfg.mmUrl, false)
+        etMmToken = input(root, "Token（只存在手机上，不进日志、不进 git）", cfg.mmToken, true)
+        etMmChannel = input(root, "频道 ID（channel_id，不是频道名）", cfg.mmChannel, false)
+        root.addView(action("测试连接", false) { testMm() })
+        root.addView(action("MM 最近消息", false) { showMmRecent() })
 
         root.addView(action("保存", true) { save() })
         root.addView(action("立刻提炼记忆", false) { consolidateNow() })
@@ -198,6 +223,10 @@ class AiSettingsActivity : Activity() {
             persona = persona,
             ttsOn = cbTts.isChecked,
             enabled = cbAi.isChecked,
+            mmOn = cbMm.isChecked,
+            mmUrl = etMmUrl.text.toString().trim(),
+            mmToken = etMmToken.text.toString().trim(),
+            mmChannel = etMmChannel.text.toString().trim(),
         )
         val ok = AiConfig.save(this, cfg)
         Prefs.setAiOn(this, cbAi.isChecked)
@@ -206,8 +235,65 @@ class AiSettingsActivity : Activity() {
         when {
             !ok -> toast("保存失败，看看上面日志 / 存储权限")
             cbAi.isChecked && !cfg.configured -> toast("已保存，但没填 API Key —— AI 还是不会启用")
+            cfg.mmOn && !cfg.mmConfigured -> toast("已保存；Mattermost 三项没填全，轮询会跳过")
             else -> toast("已保存")
         }
+    }
+
+    /**
+     * F2：「测试连接」—— 调 `MattermostBridge.test()`（GET /api/v4/users/me），把用户名显示出来。
+     *
+     * 网络不能在主线程做，这里沿用本文件 `consolidateNow()` 已有的写法（`Thread { }.start()`）：
+     * 按钮的一次性动作，跑完线程自己结束。和 F3 的轮询（走 `AiCore.onTick`）完全无关 ——
+     * 轮询本身没有为它新建任何线程。
+     */
+    private fun testMm() {
+        val url = etMmUrl.text.toString().trim()
+        val token = etMmToken.text.toString().trim()
+        if (url.isBlank() || token.isBlank()) {
+            toast("先填服务器地址和 Token")
+            return
+        }
+        toast("正在连接…")
+        Thread {
+            var msg: String
+            try {
+                msg = "连接成功，当前身份：" + MattermostBridge.test(url, token)
+            } catch (t: Throwable) {
+                msg = "连接失败：" + (t.message ?: t.javaClass.simpleName)
+            }
+            val m = msg
+            runOnUiThread { toast(m) }
+        }.start()
+    }
+
+    /** F6：最近 10 条收发（内存环形缓冲，纯文本，方便排查「为什么没回」） */
+    private fun showMmRecent() {
+        val lines = MattermostBridge.recentLines()
+        val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
+        val sb = StringBuilder()
+        if (lines.isEmpty()) {
+            sb.append("暂无收发记录。\n打开开关并保存后，每 30 秒收一次；要不要回看 AI 是否启用。")
+        } else {
+            for ((at, who, text) in lines) {
+                sb.append(fmt.format(Date(at))).append(' ').append(who).append("：")
+                    .append(text.replace("\n", " ").take(60)).append('\n')
+            }
+            sb.append("\n（只记最近 10 条，内存里，重启就没了）")
+        }
+        val tv = TextView(this).apply {
+            setText(sb.toString().trim())
+            setTextColor(cText)
+            textSize = 13f
+            setLineSpacing(dp(2).toFloat(), 1f)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            setBackgroundColor(cBg)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("MM 最近消息")
+            .setView(ScrollView(this).apply { addView(tv) })
+            .setPositiveButton("知道了", null)
+            .show()
     }
 
     /** 手动强制跑一次提炼（跳过「24 小时 / 20 条」的门槛，用户在按钮上明确要求了） */
@@ -296,7 +382,13 @@ class AiSettingsActivity : Activity() {
         } catch (t: Throwable) {
             "记忆：读取失败"
         }
-        tvStatus.text = state + "\n" + mem
+        val mm = when {
+            !on -> "MM：AI 总开关关着，不收发"
+            !cfg.mmConfigured -> "MM：未配置（地址 / Token / 频道 ID 三项都要填）"
+            !cfg.mmOn -> "MM：已填好，开关关着"
+            else -> "MM：启用中 · 每 30 秒收一次"
+        }
+        tvStatus.text = state + "\n" + mm + "\n" + mem
     }
 
     private fun toast(msg: String) {
