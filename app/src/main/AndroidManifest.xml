@@ -10,7 +10,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 开机自启（可选，由用户在设置里开） -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- 不需要网络：本 app 完全离线（无 AI、无余额查询） -->
+    <!-- 网络：只在 AI 层用（对话 / 提炼记忆）。不配 Key 就完全离线，行为和以前一致 -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- 后台保活：申请「忽略电池优化」，减少省电策略把宠物杀掉 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
@@ -36,6 +37,13 @@
             android:name=".LinesActivity"
             android:exported="false"
             android:label="@string/lines_editor_title"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- AI 设置：只有从桌宠长按菜单进来，不对外暴露 -->
+        <activity
+            android:name=".ai.AiSettingsActivity"
+            android:exported="false"
+            android:label="AI 设置"
             android:windowSoftInputMode="adjustResize" />
 
         <service

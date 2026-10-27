@@ -28,6 +28,8 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.dshpet.android.ai.AiCore
+import com.dshpet.android.ai.AiSettingsActivity
 import java.util.Calendar
 import kotlin.random.Random
 
@@ -42,7 +44,7 @@ import kotlin.random.Random
  * 所有步骤都包在 try/catch 里并写入 [Diag]：
  * 手机上闪退看不到 logcat，所以宁可降级成「界面上显示错误」也不要让进程死掉。
  */
-class PetService : Service() {
+class PetService : Service(), AiCore.Host {
 
     companion object {
         private const val TAG = "DshPetSvc"
@@ -86,6 +88,9 @@ class PetService : Service() {
     private var cfg: PetConfig? = null
     private var menuView: View? = null
     private var lines: Lines? = null
+
+    /** AI 层（对话 + 主动开口）。没配 Key 时它内部会自己退化成什么都不做 */
+    private var ai: AiCore? = null
 
     // ---- 台词气泡 ----
     private var bubbleRoot: View? = null
@@ -132,6 +137,13 @@ class PetService : Service() {
             goForeground()
         } catch (t: Throwable) {
             Diag.record(this, "onCreate: startForeground 失败（前台服务起不来）", t)
+        }
+        // AI 层最后起：它依赖上面那些（尤其是 wm / handler），而且它自己的失败不能影响桌宠本体
+        try {
+            ai = AiCore(this, this).also { it.start() }
+        } catch (t: Throwable) {
+            ai = null
+            Diag.record(this, "onCreate: AI 层初始化失败（降级为纯台词模式）", t)
         }
     }
 
@@ -502,6 +514,28 @@ class PetService : Service() {
         }
     }
 
+    // ------------------------------------------------------------ AiCore.Host
+
+    /**
+     * AI 文本的唯一出口。渲染仍然只有 [say] 一条路（它保持 private），
+     * 所以 AI 说得再花也只是一个普通气泡，不会多出第二种 UI。
+     */
+    fun sayText(text: String, pet: Pet? = null) {
+        try {
+            if (text.isBlank()) return
+            if (!Prefs.bubbleOn(this)) return
+            val p = pet ?: bubblePet ?: held.firstOrNull()?.pet ?: return
+            say(p, text)
+        } catch (t: Throwable) {
+            Diag.record(this, "sayText 失败", t)
+        }
+    }
+
+    /** AI 走不通时的退路：用现有台词库说一句 */
+    override fun sayCategory(id: String) {
+        sayFrom(id, force = true)
+    }
+
     private fun onPetTapped(pet: Pet) {
         val now = SystemClock.uptimeMillis()
         lastInteractMs = now
@@ -515,6 +549,8 @@ class PetService : Service() {
             tapCount = 0
             sayFrom("tapped")
         }
+        // AI 配好了就由她接管这次回应（内部会自己判断未配置 / 正忙 / 冷却）
+        ai?.onTap()
     }
 
     private fun onPetThrown(pet: Pet) {
@@ -685,6 +721,17 @@ class PetService : Service() {
                 ?.actions?.randomOrNull()
                 ?.let { slug -> pet.playAction(slug) }
         }
+        addRow("⚙ AI 设置 / 记忆") {
+            dismissMenu()
+            try {
+                startActivity(
+                    Intent(this, AiSettingsActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            } catch (t: Throwable) {
+                Diag.record(this, "打开 AI 设置失败", t)
+            }
+        }
         addRow("↺ 回到初始位置") {
             dismissMenu()
             pet.resetPosition()
@@ -747,6 +794,12 @@ class PetService : Service() {
                 } catch (t: Throwable) {
                     Diag.record(this@PetService, "tickSpeech 异常", t)
                 }
+                // F8 主动开口：搭现有 1 秒节流便车，不另起线程/定时器
+                try {
+                    ai?.onTick(System.currentTimeMillis())
+                } catch (t: Throwable) {
+                    Diag.record(this@PetService, "AI onTick 异常", t)
+                }
             }
             handler.postDelayed(this, if (active) 16L else 66L)
         }
@@ -763,6 +816,12 @@ class PetService : Service() {
         } catch (t: Throwable) {
             Log.w(TAG, "onDestroy: ${t.message}")
         }
+        try {
+            ai?.stop()
+        } catch (t: Throwable) {
+            Log.w(TAG, "onDestroy: AI 层停止失败 ${t.message}")
+        }
+        ai = null
         super.onDestroy()
     }
 }

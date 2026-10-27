@@ -13,6 +13,8 @@ object Prefs {
     private const val KEY_PETS = "pet_count"
     private const val KEY_BUBBLE = "bubble_on"
     private const val KEY_EDGE_HIDE = "edge_hide"
+    private const val KEY_AI_ON = "ai_on"
+    private const val KEY_AI_TTS = "ai_tts"
 
     const val DEFAULT_SIZE_DP = 150
     const val MIN_SIZE_DP = 80
@@ -74,5 +76,19 @@ object Prefs {
 
     fun setKeepAliveAsked(ctx: Context, v: Boolean) {
         sp(ctx).edit().putBoolean(KEY_KEEP_ALIVE_ASKED, v).apply()
+    }
+
+    /** AI 层总开关，默认关闭：没配 Key 之前桌宠行为和以前完全一样 */
+    fun aiOn(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_AI_ON, false)
+
+    fun setAiOn(ctx: Context, v: Boolean) {
+        sp(ctx).edit().putBoolean(KEY_AI_ON, v).apply()
+    }
+
+    /** 语音朗读开关（本期只存值，发声留下一票） */
+    fun aiTts(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_AI_TTS, false)
+
+    fun setAiTts(ctx: Context, v: Boolean) {
+        sp(ctx).edit().putBoolean(KEY_AI_TTS, v).apply()
     }
 }
